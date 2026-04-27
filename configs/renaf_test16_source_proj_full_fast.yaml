@@ -1,0 +1,9 @@
+inherit_from: /das/work/p20/p20846/RefractoryEventCT/RENAF/config/Apri_raw_config/run_e/test16.yaml
+geometry:
+  nDetector: [640, 360]
+  dDetector: [2.0, 2.0]
+  nVoxel: [512, 512, 720]
+  dVoxel: [2.5, 2.5, 1.0]
+  voxel_slice_count_z:
+train:
+  mode: proj

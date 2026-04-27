@@ -98,7 +98,12 @@ def metric_vol(img1, img2, metric="psnr", pixel_max=1.0):
 
     if metric == "psnr":
         if pixel_max is None:
+            pixel_max = img1.max() - img1.min()
+        elif pixel_max == "max":
             pixel_max = img1.max()
+        elif pixel_max == "range":
+            pixel_max = img1.max() - img1.min()
+        pixel_max = torch.as_tensor(pixel_max, dtype=img1.dtype, device=img1.device).clamp_min(1e-12)
         mse_out = torch.mean((img1 - img2) ** 2)
         psnr_out = 10 * torch.log10(pixel_max**2 / mse_out.float())
         return psnr_out.item(), None

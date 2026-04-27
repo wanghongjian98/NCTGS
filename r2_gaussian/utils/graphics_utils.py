@@ -94,27 +94,15 @@ def getWorld2View2(R, t, translate=np.array([0.0, 0.0, 0.0]), scale=1.0):
 
 def getProjectionMatrix(fovX, fovY, mode, scanner_cfg):
     if mode == 0:  # Parallel beam
-        # sVoxel = scanner_cfg["sVoxel"][0]  # Assume cube only!
-        # sVoxel_half = sVoxel / 2
-        # DSO = scanner_cfg["DSO"]
-        # near = DSO - sVoxel_half
-        # far = DSO + sVoxel_half
-        # top = sVoxel_half
-        # bottom = -sVoxel_half
-        # right = sVoxel_half
-        # left = -sVoxel_half
-        # P = torch.zeros(4, 4)
-        # z_sign = 1.0
-        # P[0, 0] = 2.0 / (right - left)
-        # P[0, 3] = -(right + left) / (right - left)
-        # P[1, 1] = 2.0 / (top - bottom)
-        # P[1, 3] = -(top + bottom) / (top - bottom)
-        # P[2, 2] = z_sign * 2.0 / (far - near)
-        # P[2, 3] = -(far + near) / (far - near)
-        # P[3, 3] = z_sign
-
-        # Projection matrix is eye
+        detector_h = float(scanner_cfg["sDetector"][0])
+        detector_w = float(scanner_cfg["sDetector"][1])
+        off_v = float(scanner_cfg.get("offDetector", [0.0, 0.0])[0])
+        off_u = float(scanner_cfg.get("offDetector", [0.0, 0.0])[1])
         P = torch.eye(4)
+        P[0, 0] = 2.0 / detector_w
+        P[1, 1] = 2.0 / detector_h
+        P[0, 3] = -2.0 * off_u / detector_w
+        P[1, 3] = -2.0 * off_v / detector_h
     elif mode == 1:
         znear = 0.01
         zfar = 100.0

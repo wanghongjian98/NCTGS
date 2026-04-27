@@ -16,7 +16,9 @@ from r2_gaussian.utils.image_utils import metric_vol
 
 def recon_volume(projs, angles, geo, recon_method):
     """Reconstruct ct with traditional methods."""
-    if recon_method == "fdk":
+    if recon_method == "fbp":
+        vol = algs.fbp(projs[:, ::-1, :], geo, angles)
+    elif recon_method == "fdk":
         vol = algs.fdk(projs[:, ::-1, :], geo, angles)
     elif recon_method == "cgls":
         vol, _ = algs.cgls(projs[:, ::-1, :], geo, angles, 60, computel2=True)

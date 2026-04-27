@@ -45,7 +45,6 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.mode = mode
-        self.scanner_cfg = scanner_cfg
         self.image_name = image_name
 
         try:

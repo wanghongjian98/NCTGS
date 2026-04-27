@@ -1,0 +1,44 @@
+source_path: /das/work/p20/p20846/RefractoryEventCT/eventgs/r2_gaussian/configs/renaf_test16_source_proj_medium_eval.yaml
+model_path: /das/work/p20/p20846/RefractoryEventCT/eventgs/r2_gaussian/output/renaf_test16_h5_proj_medium_eval
+ply_path: /das/work/p20/p20846/RefractoryEventCT/eventgs/r2_gaussian/configs/init_renaf_test16_source_proj_medium_eval_center_crop_75k.npy
+init_num_points: 75000
+data_device: cuda
+save_volume_npy: false
+save_volume_png: true
+save_volume_png_count: 15
+scale_max: 0.03
+
+iterations: 30000
+test_iterations: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000, 21000, 22000, 23000, 24000, 25000, 26000, 27000, 28000, 29000, 30000]
+save_iterations: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000, 21000, 22000, 23000, 24000, 25000, 26000, 27000, 28000, 29000, 30000]
+checkpoint_iterations: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000, 21000, 22000, 23000, 24000, 25000, 26000, 27000, 28000, 29000, 30000]
+
+lambda_dssim: 0.0
+views_per_iter: 1
+lambda_tv: 0.0
+tv_vol_size: 32
+tv_interval: 10
+position_lr_init: 0.00001
+position_lr_final: 0.000001
+scaling_lr_init: 0.001
+scaling_lr_final: 0.0001
+rotation_lr_init: 0.0002
+rotation_lr_final: 0.00002
+density_lr_init: 0.001
+density_lr_final: 0.0001
+density_min_threshold: 0.0
+
+densify_from_iter: 1000
+densify_until_iter: 9000
+densification_interval: 200
+densify_grad_threshold: 0.00005
+densify_scale_threshold: 0.03
+max_scale: 0.03
+max_num_gaussians: 100000
+
+eval_max_cameras: 12
+eval_3d_interval: 30000
+eval_slice_interval: 1000
+eval_slice_count: 5
+eval_save_projection_png: true
+eval_projection_png_count: 5

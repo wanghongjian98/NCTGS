@@ -1,0 +1,3 @@
+inherit_from: /das/work/p20/p20846/RefractoryEventCT/RENAF/config/Apri_raw_config/run_e/test16.yaml
+train:
+  mode: event

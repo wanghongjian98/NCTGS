@@ -1,0 +1,23 @@
+source_path: /das/work/p20/p20846/RefractoryEventCT/eventgs/r2_gaussian/configs/renaf_test16_source_proj_full_fast.yaml
+model_path: /das/work/p20/p20846/RefractoryEventCT/eventgs/r2_gaussian/output/renaf_test16_h5_proj_full_fast
+data_device: cuda
+
+iterations: 15000
+test_iterations: [5000, 10000, 15000]
+save_iterations: [5000, 10000, 15000]
+checkpoint_iterations: [5000, 10000, 15000]
+
+lambda_dssim: 0.0
+lambda_tv: 0.0
+position_lr_init: 0.00005
+position_lr_final: 0.000005
+density_lr_init: 0.002
+density_lr_final: 0.0002
+density_min_threshold: 0.0
+
+densify_from_iter: 1000
+densify_until_iter: 8000
+densification_interval: 300
+densify_grad_threshold: 0.0001
+densify_scale_threshold: 0.08
+max_num_gaussians: 50000

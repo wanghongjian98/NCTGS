@@ -12,11 +12,12 @@
 import os
 import os.path as osp
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from random import randint
 import sys
 from tqdm import tqdm
 from argparse import ArgumentParser
-from copy import copy
 import numpy as np
 import yaml
 
@@ -27,21 +28,106 @@ from r2_gaussian.utils.general_utils import safe_state
 from r2_gaussian.utils.cfg_utils import load_config
 from r2_gaussian.utils.log_utils import prepare_output_and_logger
 from r2_gaussian.dataset import Scene
+from r2_gaussian.dataset.cameras import Camera
+from r2_gaussian.dataset.dataset_readers import angle2pose, mode_id
 from r2_gaussian.utils.loss_utils import l1_loss, ssim, tv_3d_loss
 from r2_gaussian.utils.image_utils import metric_vol, metric_proj
 from r2_gaussian.utils.plot_utils import show_two_slice
 
 
-def _save_eval_projection_grid(rows, save_path):
-    if not rows:
-        return
-    import matplotlib
+class SimpleEventParams(nn.Module):
+    def __init__(self, tau_us=300.0, tau_min_us=1.0, tau_max_us=1000.0):
+        super().__init__()
+        self.register_buffer("tau_min_us", torch.tensor(float(tau_min_us), dtype=torch.float32))
+        self.register_buffer("tau_max_us", torch.tensor(float(tau_max_us), dtype=torch.float32))
+        self.register_buffer("tau_us", torch.tensor(float(tau_us), dtype=torch.float32))
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    def get_tau_us(self):
+        return self.tau_us.clamp(float(self.tau_min_us), float(self.tau_max_us))
 
-    grid = np.concatenate(rows, axis=0)
-    plt.imsave(save_path, grid)
+
+def make_event_camera(scanner_cfg, angle, uid, data_device):
+    c2w = angle2pose(scanner_cfg["DSO"], float(angle))
+    w2c = np.linalg.inv(c2w)
+    R = np.transpose(w2c[:3, :3])
+    T = w2c[:3, 3]
+    fov_x = np.arctan2(scanner_cfg["sDetector"][1] / 2, scanner_cfg["DSD"]) * 2
+    fov_y = np.arctan2(scanner_cfg["sDetector"][0] / 2, scanner_cfg["DSD"]) * 2
+    height = int(scanner_cfg["nDetector"][1])
+    width = int(scanner_cfg["nDetector"][0])
+    image = torch.zeros((1, height, width), dtype=torch.float32)
+    return Camera(
+        colmap_id=uid,
+        scanner_cfg=scanner_cfg,
+        R=R,
+        T=T,
+        angle=float(angle),
+        mode=mode_id[scanner_cfg["mode"]],
+        FoVx=fov_x,
+        FoVy=fov_y,
+        image=image,
+        image_name=f"event_{uid:04d}",
+        uid=uid,
+        data_device=data_device,
+    )
+
+
+def event_timestamps_to_angles(ts_us, event_data, angle_bins):
+    alpha = (ts_us.astype(np.float64) - float(event_data["t_start"])) / float(event_data["total_len"])
+    alpha = np.clip(alpha, 0.0, 1.0)
+    if int(angle_bins) > 1:
+        alpha = np.round(alpha * (int(angle_bins) - 1)) / float(int(angle_bins) - 1)
+    return (
+        float(event_data["angle_min"])
+        + alpha * (float(event_data["angle_max"]) - float(event_data["angle_min"]))
+    ).astype(np.float32)
+
+
+def render_event_values(angles, xs, ys, scene, gaussians, pipe, data_device):
+    values = torch.empty((angles.shape[0],), dtype=torch.float32, device="cuda")
+    unique_angles, inverse = np.unique(angles, return_inverse=True)
+    for i_angle, angle in enumerate(unique_angles):
+        mask = inverse == i_angle
+        camera = make_event_camera(scene.scanner_cfg, float(angle), int(i_angle), data_device)
+        image = render(camera, gaussians, pipe)["render"][0]
+        x_t = torch.from_numpy(xs[mask].astype(np.int64, copy=False)).long().cuda()
+        y_t = torch.from_numpy(ys[mask].astype(np.int64, copy=False)).long().cuda()
+        idx_t = torch.from_numpy(np.flatnonzero(mask).astype(np.int64)).long().cuda()
+        values[idx_t] = image[y_t, x_t]
+    return values
+
+
+def compute_event_loss(scene, gaussians, pipe, opt, event_params, data_device):
+    event_data = scene.event_data
+    total_pairs = int(event_data["x"].shape[0])
+    if total_pairs == 0:
+        return None
+
+    sample_n = min(int(opt.event_pairs_per_iter), total_pairs)
+    indices = np.random.choice(total_pairs, size=sample_n, replace=total_pairs < sample_n)
+    xs = event_data["x"][indices].astype(np.int64, copy=False)
+    ys = event_data["y"][indices].astype(np.int64, copy=False)
+    t0 = event_data["start_ts"][indices].astype(np.float64, copy=False)
+    t1 = event_data["end_ts"][indices].astype(np.float64, copy=False)
+    polarity_np = event_data["polarity"][indices].astype(np.float32, copy=False)
+    tau_us = float(event_params.get_tau_us().detach().cpu().item())
+    t_ref = t0 + tau_us
+    valid = t_ref < t1
+    if not np.any(valid):
+        return torch.tensor(0.0, device="cuda")
+
+    xs = xs[valid]
+    ys = ys[valid]
+    t_ref = t_ref[valid]
+    t1 = t1[valid]
+    polarity = torch.from_numpy(polarity_np[valid]).float().cuda()
+    ref_angles = event_timestamps_to_angles(t_ref, event_data, opt.event_angle_bins)
+    curr_angles = event_timestamps_to_angles(t1, event_data, opt.event_angle_bins)
+    log_l_ref = -render_event_values(ref_angles, xs, ys, scene, gaussians, pipe, data_device)
+    log_l_curr = -render_event_values(curr_angles, xs, ys, scene, gaussians, pipe, data_device)
+    signed_diff = polarity * (log_l_curr - log_l_ref)
+    beta = float(opt.event_softplus_beta)
+    return (F.softplus(-beta * signed_diff) / beta).mean()
 
 
 def training(
@@ -85,6 +171,20 @@ def training(
     initialize_gaussian(gaussians, dataset, None)
     scene.gaussians = gaussians
     gaussians.training_setup(opt)
+    event_params = None
+    if scene.event_data is not None and opt.event_lambda > 0:
+        event_params = SimpleEventParams(
+            tau_us=opt.event_tau_us,
+            tau_min_us=opt.event_tau_min_us,
+            tau_max_us=opt.event_tau_max_us,
+        ).cuda()
+        print(
+            "[Events] enabled: "
+            f"pairs={scene.event_data['x'].shape[0]}, "
+            f"pairs_per_iter={opt.event_pairs_per_iter}, "
+            f"angle_bins={opt.event_angle_bins}, "
+            f"lambda={opt.event_lambda}, tau_us={float(event_params.get_tau_us().item()):.3f}"
+        )
     if checkpoint is not None:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -97,14 +197,6 @@ def training(
         tv_vol_size = opt.tv_vol_size
         tv_vol_nVoxel = torch.tensor([tv_vol_size, tv_vol_size, tv_vol_size])
         tv_vol_sVoxel = torch.tensor(scanner_cfg["dVoxel"]) * tv_vol_nVoxel
-        tv_pipe = copy(pipe)
-        if str(getattr(tv_pipe, "voxelizer_backend", "xray")).lower() in (
-            "gs",
-            "gs_voxelizer",
-            "gs-voxelizer",
-        ):
-            tv_pipe.voxelizer_backend = "xray"
-            print("Use xray voxelizer for TV sub-volume queries")
 
     # Train
     iter_start = torch.cuda.Event(enable_timing=True)
@@ -112,7 +204,6 @@ def training(
     ckpt_save_path = osp.join(scene.model_path, "ckpt")
     os.makedirs(ckpt_save_path, exist_ok=True)
     viewpoint_stack = None
-    views_per_iter = max(1, int(getattr(opt, "views_per_iter", 1)))
     progress_bar = tqdm(range(0, opt.iterations), desc="Train", leave=False)
     progress_bar.update(first_iter)
     first_iter += 1
@@ -122,38 +213,32 @@ def training(
         # Update learning rate
         gaussians.update_learning_rate(iteration)
 
-        render_records = []
-        render_losses = []
-        dssim_losses = []
-        for _ in range(views_per_iter):
-            if not viewpoint_stack:
-                viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        # Get one camera for training
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-            # Render X-ray projection
-            render_pkg = render(viewpoint_cam, gaussians, pipe)
-            image, viewspace_point_tensor, visibility_filter, radii = (
-                render_pkg["render"],
-                render_pkg["viewspace_points"],
-                render_pkg["visibility_filter"],
-                render_pkg["radii"],
-            )
+        # Render X-ray projection
+        render_pkg = render(viewpoint_cam, gaussians, pipe)
+        image, viewspace_point_tensor, visibility_filter, radii = (
+            render_pkg["render"],
+            render_pkg["viewspace_points"],
+            render_pkg["visibility_filter"],
+            render_pkg["radii"],
+        )
 
-            # Compute per-view projection loss
-            gt_image = viewpoint_cam.original_image.cuda()
-            render_losses.append(l1_loss(image, gt_image))
-            if opt.lambda_dssim > 0:
-                dssim_losses.append(1.0 - ssim(image, gt_image))
-            render_records.append((viewspace_point_tensor, visibility_filter, radii))
-
+        # Compute loss
+        gt_image = viewpoint_cam.original_image.cuda()
         loss = {"total": 0.0}
-        loss["render"] = torch.stack(render_losses).mean()
+        render_loss = l1_loss(image, gt_image)
+        loss["render"] = render_loss
         loss["total"] += loss["render"]
-        if dssim_losses:
-            loss["dssim"] = torch.stack(dssim_losses).mean()
-            loss["total"] = loss["total"] + opt.lambda_dssim * loss["dssim"]
+        if opt.lambda_dssim > 0:
+            loss_dssim = 1.0 - ssim(image, gt_image)
+            loss["dssim"] = loss_dssim
+            loss["total"] = loss["total"] + opt.lambda_dssim * loss_dssim
         # 3D TV loss
-        if use_tv and iteration % max(1, int(opt.tv_interval)) == 0:
+        if use_tv:
             # Randomly get the tiny volume center
             tv_vol_center = (bbox[0] + tv_vol_sVoxel / 2) + (
                 bbox[1] - tv_vol_sVoxel - bbox[0]
@@ -163,11 +248,18 @@ def training(
                 tv_vol_center,
                 tv_vol_nVoxel,
                 tv_vol_sVoxel,
-                tv_pipe,
+                pipe,
             )["vol"]
             loss_tv = tv_3d_loss(vol_pred, reduction="mean")
             loss["tv"] = loss_tv
             loss["total"] = loss["total"] + opt.lambda_tv * loss_tv
+        if event_params is not None and iteration >= opt.event_start_iter:
+            loss_event = compute_event_loss(
+                scene, gaussians, pipe, opt, event_params, dataset.data_device
+            )
+            if loss_event is not None:
+                loss["event"] = loss_event
+                loss["total"] = loss["total"] + opt.event_lambda * loss_event
 
         loss["total"].backward()
 
@@ -176,13 +268,10 @@ def training(
 
         with torch.no_grad():
             # Adaptive control
-            for viewspace_point_tensor, visibility_filter, radii in render_records:
-                gaussians.max_radii2D[visibility_filter] = torch.max(
-                    gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
-                )
-                gaussians.add_densification_stats(
-                    viewspace_point_tensor, visibility_filter
-                )
+            gaussians.max_radii2D[visibility_filter] = torch.max(
+                gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+            )
+            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
             if iteration < opt.densify_until_iter:
                 if (
                     iteration > opt.densify_from_iter
@@ -247,48 +336,7 @@ def training(
                 scene,
                 lambda x, y: render(x, y, pipe),
                 queryfunc,
-                opt,
-                pipe,
             )
-
-
-def _limit_eval_cameras(cameras, max_cameras):
-    if not max_cameras or max_cameras <= 0 or len(cameras) <= max_cameras:
-        return cameras
-    indices = np.linspace(0, len(cameras) - 1, int(max_cameras), dtype=int)
-    return [cameras[int(idx)] for idx in indices]
-
-
-def _eval_slice_indices(n_slices, count):
-    count = max(0, min(int(count), int(n_slices)))
-    if count == 0:
-        return []
-    return [int(idx) for idx in np.linspace(0, int(n_slices), count + 2).astype(int)[1:-1]]
-
-
-def _query_z_slices(gaussians, scanner_cfg, pipe, slice_indices):
-    n_voxel = np.array(scanner_cfg["nVoxel"], dtype=np.int64)
-    s_voxel = np.array(scanner_cfg["sVoxel"], dtype=np.float64)
-    center = np.array(scanner_cfg["offOrigin"], dtype=np.float64)
-    d_voxel = s_voxel / n_voxel
-    slice_n_voxel = [int(n_voxel[0]), int(n_voxel[1]), 1]
-    slice_s_voxel = [float(s_voxel[0]), float(s_voxel[1]), float(d_voxel[2])]
-
-    slices = []
-    z_min = center[2] - s_voxel[2] * 0.5
-    for idx in slice_indices:
-        slice_center = center.copy()
-        slice_center[2] = z_min + (float(idx) + 0.5) * d_voxel[2]
-        slices.append(
-            query(
-                gaussians,
-                slice_center.tolist(),
-                slice_n_voxel,
-                slice_s_voxel,
-                pipe,
-            )["vol"][..., 0]
-        )
-    return torch.stack(slices, dim=-1)
 
 
 def training_report(
@@ -300,8 +348,6 @@ def training_report(
     scene: Scene,
     renderFunc,
     queryFunc,
-    opt,
-    pipe,
 ):
     # Add training statistics
     if tb_writer:
@@ -319,18 +365,8 @@ def training_report(
         torch.cuda.empty_cache()
 
         validation_configs = [
-            {
-                "name": "render_train",
-                "cameras": _limit_eval_cameras(
-                    scene.getTrainCameras(), int(opt.eval_max_cameras)
-                ),
-            },
-            {
-                "name": "render_test",
-                "cameras": _limit_eval_cameras(
-                    scene.getTestCameras(), int(opt.eval_max_cameras)
-                ),
-            },
+            {"name": "render_train", "cameras": scene.getTrainCameras()},
+            {"name": "render_test", "cameras": scene.getTestCameras()},
         ]
         psnr_2d, ssim_2d = None, None
         for config in validation_configs:
@@ -338,15 +374,8 @@ def training_report(
                 images = []
                 gt_images = []
                 image_show_2d = []
-                projection_rows = []
                 # Render projections
-                show_idx = np.unique(
-                    np.linspace(
-                        0,
-                        len(config["cameras"]) - 1,
-                        min(int(opt.eval_projection_png_count), len(config["cameras"])),
-                    ).astype(int)
-                )
+                show_idx = np.linspace(0, len(config["cameras"]), 7).astype(int)[1:-1]
                 for idx, viewpoint in enumerate(config["cameras"]):
                     image = renderFunc(
                         viewpoint,
@@ -355,20 +384,20 @@ def training_report(
                     gt_image = viewpoint.original_image.to("cuda")
                     images.append(image)
                     gt_images.append(gt_image)
-                    if idx in show_idx:
-                        row = show_two_slice(
-                            gt_image[0],
-                            image[0],
-                            f"{viewpoint.image_name} gt",
-                            f"{viewpoint.image_name} render",
-                            vmin=gt_image[0].min() if iteration != 1 else None,
-                            vmax=gt_image[0].max() if iteration != 1 else None,
-                            save=True,
+                    if tb_writer and idx in show_idx:
+                        image_show_2d.append(
+                            torch.from_numpy(
+                                show_two_slice(
+                                    gt_image[0],
+                                    image[0],
+                                    f"{viewpoint.image_name} gt",
+                                    f"{viewpoint.image_name} render",
+                                    vmin=gt_image[0].min() if iteration != 1 else None,
+                                    vmax=gt_image[0].max() if iteration != 1 else None,
+                                    save=True,
+                                )
+                            )
                         )
-                        if bool(opt.eval_save_projection_png):
-                            projection_rows.append(row)
-                        if tb_writer:
-                            image_show_2d.append(torch.from_numpy(row))
                 images = torch.concat(images, 0).permute(1, 2, 0)
                 gt_images = torch.concat(gt_images, 0).permute(1, 2, 0)
                 psnr_2d, psnr_2d_projs = metric_proj(gt_images, images, "psnr")
@@ -386,16 +415,8 @@ def training_report(
                     yaml.dump(
                         eval_dict_2d, f, default_flow_style=False, sort_keys=False
                     )
-                if projection_rows:
-                    _save_eval_projection_grid(
-                        projection_rows,
-                        osp.join(
-                            eval_save_path,
-                            f"eval2d_{config['name']}_projections.png",
-                        ),
-                    )
 
-                if tb_writer and image_show_2d:
+                if tb_writer:
                     image_show_2d = torch.from_numpy(
                         np.concatenate(image_show_2d, axis=0)
                     )[None].permute([0, 3, 1, 2])
@@ -411,24 +432,13 @@ def training_report(
                         config["name"] + "/ssim_2d", ssim_2d, iteration
                     )
 
-        eval_3d_this_iter = (
-            scene.vol_gt is not None
-            and (
-                int(opt.eval_3d_interval) <= 0
-                or iteration % int(opt.eval_3d_interval) == 0
-                or iteration == int(opt.iterations)
-            )
-        )
-        if eval_3d_this_iter:
+        if scene.vol_gt is not None:
             vol_pred = queryFunc(scene.gaussians)["vol"]
             vol_gt = scene.vol_gt
-            psnr_3d_raw, _ = metric_vol(vol_gt, vol_pred, "psnr", pixel_max=1.0)
-            psnr_3d, _ = metric_vol(vol_gt, vol_pred, "psnr", pixel_max="range")
+            psnr_3d, _ = metric_vol(vol_gt, vol_pred, "psnr")
             ssim_3d, ssim_3d_axis = metric_vol(vol_gt, vol_pred, "ssim")
             eval_dict = {
                 "psnr_3d": psnr_3d,
-                "psnr_3d_pixelmax1": psnr_3d_raw,
-                "psnr_3d_pixelmax": "gt_range",
                 "ssim_3d": ssim_3d,
                 "ssim_3d_x": ssim_3d_axis[0],
                 "ssim_3d_y": ssim_3d_axis[1],
@@ -463,76 +473,11 @@ def training_report(
             tqdm.write(
                 f"[ITER {iteration}] Evaluating: psnr3d {psnr_3d:.3f}, ssim3d {ssim_3d:.3f}, psnr2d {psnr_2d:.3f}, ssim2d {ssim_2d:.3f}"
             )
-        elif (
-            scene.vol_gt is not None
-            and int(getattr(opt, "eval_slice_interval", 0)) > 0
-            and iteration % int(opt.eval_slice_interval) == 0
-        ):
-            slice_indices = _eval_slice_indices(
-                scene.vol_gt.shape[2], int(getattr(opt, "eval_slice_count", 5))
-            )
-            with torch.no_grad():
-                vol_pred_slices = _query_z_slices(
-                    scene.gaussians,
-                    scene.scanner_cfg,
-                    pipe,
-                    slice_indices,
-                )
-            vol_gt_slices = scene.vol_gt[..., slice_indices]
-            slice_rows = [
-                show_two_slice(
-                    vol_gt_slices[..., row_idx],
-                    vol_pred_slices[..., row_idx],
-                    f"slice {slice_idx} gt",
-                    f"slice {slice_idx} pred",
-                    vmin=vol_gt_slices[..., row_idx].min(),
-                    vmax=vol_gt_slices[..., row_idx].max(),
-                    save=True,
-                )
-                for row_idx, slice_idx in enumerate(slice_indices)
-            ]
-            _save_eval_projection_grid(
-                slice_rows,
-                osp.join(eval_save_path, "eval3d_selected_slices.png"),
-            )
-            with open(osp.join(eval_save_path, "eval3d.yml"), "w") as f:
-                yaml.dump(
-                    {
-                        "skipped": f"full 3D eval interval is {int(opt.eval_3d_interval)}",
-                        "selected_slice_indices": slice_indices,
-                        "selected_slice_png": "eval3d_selected_slices.png",
-                    },
-                    f,
-                    default_flow_style=False,
-                    sort_keys=False,
-                )
-            if tb_writer and slice_rows:
-                image_show_3d = torch.from_numpy(np.concatenate(slice_rows, axis=0))[
-                    None
-                ].permute([0, 3, 1, 2])
-                tb_writer.add_images(
-                    "reconstruction/selected_slice-gt_pred_diff",
-                    image_show_3d,
-                    global_step=iteration,
-                )
-            tqdm.write(
-                f"[ITER {iteration}] Evaluating: selected 3D slices {slice_indices}, psnr2d {psnr_2d:.3f}, ssim2d {ssim_2d:.3f}; skipped full 3D"
-            )
-        elif scene.vol_gt is None:
+        else:
             with open(osp.join(eval_save_path, "eval3d.yml"), "w") as f:
                 yaml.dump({"skipped": "no ground-truth volume"}, f, default_flow_style=False)
             tqdm.write(
                 f"[ITER {iteration}] Evaluating: no 3D GT, psnr2d {psnr_2d:.3f}, ssim2d {ssim_2d:.3f}"
-            )
-        else:
-            with open(osp.join(eval_save_path, "eval3d.yml"), "w") as f:
-                yaml.dump(
-                    {"skipped": f"3D eval interval is {int(opt.eval_3d_interval)}"},
-                    f,
-                    default_flow_style=False,
-                )
-            tqdm.write(
-                f"[ITER {iteration}] Evaluating: 2D psnr {psnr_2d:.3f}, ssim {ssim_2d:.3f}; skipped 3D"
             )
 
         # Record other metrics

@@ -24,9 +24,13 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self.data_device = "cuda"
         self.ply_path = ""  # Path to initialization point cloud (if None, we will try to find `init_*.npy`.)
+        self.init_num_points = 50000
         self.scale_min = 0.0005  # percent of volume size
         self.scale_max = 0.5  # percent of volume size
         self.eval = True
+        self.save_volume_npy = True
+        self.save_volume_png = False
+        self.save_volume_png_count = 15
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -58,8 +62,10 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr_final = 0.0001
         self.rotation_lr_max_steps = 30_000
         self.lambda_dssim = 0.25
+        self.views_per_iter = 1
         self.lambda_tv = 0.05
         self.tv_vol_size = 32
+        self.tv_interval = 1
         self.density_min_threshold = 0.00001
         self.densification_interval = 100
         self.densify_from_iter = 500
@@ -69,6 +75,20 @@ class OptimizationParams(ParamGroup):
         self.max_screen_size = None
         self.max_scale = None  # percent of volume size
         self.max_num_gaussians = 500_000
+        self.eval_max_cameras = 0
+        self.eval_3d_interval = 0
+        self.eval_slice_interval = 0
+        self.eval_slice_count = 5
+        self.eval_save_projection_png = True
+        self.eval_projection_png_count = 5
+        self.event_lambda = 0.0
+        self.event_pairs_per_iter = 256
+        self.event_tau_us = 300.0
+        self.event_tau_min_us = 1.0
+        self.event_tau_max_us = 1000.0
+        self.event_angle_bins = 32
+        self.event_softplus_beta = 10.0
+        self.event_start_iter = 1
         super().__init__(parser, "Optimization Parameters")
 
 

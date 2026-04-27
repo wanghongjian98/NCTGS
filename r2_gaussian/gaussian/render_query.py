@@ -102,8 +102,8 @@ def render(
     # Set up rasterization configuration
     mode = viewpoint_camera.mode
     if mode == 0:
-        tanfovx = 1.0
-        tanfovy = 1.0
+        tanfovx = float(viewpoint_camera.scanner_cfg["sDetector"][1]) * 0.5
+        tanfovy = float(viewpoint_camera.scanner_cfg["sDetector"][0]) * 0.5
     elif mode == 1:
         tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
         tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
